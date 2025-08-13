@@ -64,11 +64,23 @@ app.get("/logout", (req, res) => {
   });
 });
 
-app.get("/secrets", (req, res) => {
+app.get("/secrets", async (req, res) => {
   if (req.isAuthenticated()) {
-    res.render("secrets.ejs");
-
-    //TODO: Update this to pull in the user secret to render in secrets.ejs
+    try {
+      const email = req.user.email; // works for both local and Google
+      const result = await db.query(
+        "SELECT secret FROM auth WHERE email = $1",
+        [email]
+      );
+      const secret =
+        result.rows.length === 0 || !result.rows[0].secret
+          ? "Submit your secret"
+          : result.rows[0].secret;
+      res.render("secrets.ejs", { secret });
+    } catch (err) {
+      console.error("Error fetching secrets:", err);
+      res.status(500).send("Internal Server Error");
+    }
   } else {
     res.redirect("/login");
   }
@@ -76,6 +88,14 @@ app.get("/secrets", (req, res) => {
 
 //TODO: Add a get route for the submit button
 //Think about how the logic should work with authentication.
+app.get("/submit", (req, res) => {
+  if (req.isAuthenticated()) {
+    //req.isAuthenticated() to check if user has already loged in preventing unauthorized access
+    res.render("submit.ejs");
+  } else {
+    res.redirect("/login");
+  }
+});
 
 app.get(
   "/auth/google",
@@ -135,6 +155,20 @@ app.post("/register", async (req, res) => {
 
 //TODO: Create the post route for submit.
 //Handle the submitted data and add it to the database
+app.post("/submit", async (req, res) => {
+  try {
+    const secret = req.body.secret;
+    const email = req.user.email;
+    await db.query("UPDATE auth SET secret = $1 WHERE email = $2", [
+      secret,
+      email,
+    ]);
+    res.redirect("/secrets");
+  } catch (err) {
+    console.error("Error fetching secrets:", err);
+    res.status(500).send("Internal Server Error");
+  }
+});
 
 passport.use(
   "local",
