@@ -5,7 +5,8 @@ import passport from "passport";
 import { Strategy } from "passport-local";
 import session from "express-session";
 import GoogleStrategy from "passport-google-oauth2";
-import sgMail from "@sendgrid/mail";
+import nodemailer from "nodemailer";
+import { google } from "googleapis";
 import crypto from "crypto"; // NEW - to generate secure random tokens
 import dotenv from "dotenv";
 
@@ -45,23 +46,49 @@ db.connect()
 
 // Items will be fetched from the database, not hardcoded.
 
-//SMTP setup
-sgMail.setApiKey(process.env.SENDGRID_API_KEY);
-// const msg = {
-//   to: ["vinceumali81@gmail.com", "noreply.secretapp@gmail.com"],
-//   from: {
-//     name: "Secret App",
-//     email: "noreply.secretapp@gmail.com",
-//   },
-//   subject: "Welcome to Our Secret App!",
-//   text: "Thank you for registering!",
-//   html: "<h1>Thank you for registering!</h1>",
-// };
+// Gmail OAuth2 setup (after dotenv.config())
+const gmailOAuth2Client = new google.auth.OAuth2(
+  process.env.GMAIL_CLIENT_ID,
+  process.env.GMAIL_CLIENT_SECRET,
+  process.env.GMAIL_REDIRECT_URI
+);
 
-// sgMail
-//   .send(msg)
-//   .then((response) => console.log("Email sent"))
-//   .catch((error) => console.error("Error sending email:", error));
+async function sendVerificationEmail(to, verificationLink) {
+  gmailOAuth2Client.setCredentials({
+    refresh_token: process.env.GMAIL_REFRESH_TOKEN,
+  });
+  const accessTokenObj = await gmailOAuth2Client.getAccessToken();
+  const accessToken = accessTokenObj.token || accessTokenObj;
+
+  const transporter = nodemailer.createTransport({
+    service: "gmail",
+    auth: {
+      type: "OAuth2",
+      user: process.env.GMAIL_SENDER_EMAIL,
+      clientId: process.env.GMAIL_CLIENT_ID,
+      clientSecret: process.env.GMAIL_CLIENT_SECRET,
+      refreshToken: process.env.GMAIL_REFRESH_TOKEN,
+      accessToken,
+    },
+  });
+
+  await transporter.sendMail({
+    from: `"Secret App" <${process.env.GMAIL_SENDER_EMAIL}>`,
+    to,
+    subject: "Verify your email",
+    html: `
+      <h1>Email Verification</h1>
+      <p>Thanks for registering! Please verify your email by clicking the link below:</p>
+      <a href="${verificationLink}">${verificationLink}</a>
+      <p>This link will expire in 24 hours.</p>
+    `,
+  });
+}
+
+// (Optional) route to inspect OAuth callback if you ever add that redirect locally
+app.get("/oauth2callback", async (req, res) => {
+  res.send("OAuth playground used for tokens; no handler needed here.");
+});
 
 app.get("/", (req, res) => {
   res.render("home.ejs");
@@ -87,9 +114,9 @@ app.get("/logout", (req, res) => {
 app.get("/secrets", async (req, res) => {
   if (req.isAuthenticated()) {
     try {
-      const email = req.user.email; // works for both local and Google
+      const email = req.user.email;
       const result = await db.query(
-        "SELECT secret FROM auth WHERE email = $1",
+        "SELECT secret FROM google_auth WHERE email = $1",
         [email]
       );
       const secret =
@@ -145,9 +172,10 @@ app.post("/register", async (req, res) => {
   const password = req.body.password;
 
   try {
-    const checkResult = await db.query("SELECT * FROM auth WHERE email = $1", [
-      email,
-    ]);
+    const checkResult = await db.query(
+      "SELECT * FROM google_auth WHERE email = $1",
+      [email]
+    );
 
     if (checkResult.rows.length > 0) {
       res.redirect("/login");
@@ -156,39 +184,21 @@ app.post("/register", async (req, res) => {
         if (err) {
           console.error("Error hashing password:", err);
         } else {
-          // NEW: Generate a unique verification token
           const verificationToken = crypto.randomBytes(32).toString("hex");
 
-          const result = await db.query(
-            "INSERT INTO auth (email, password, verified, verification_token) VALUES ($1, $2, $3, $4) RETURNING *",
+          await db.query(
+            "INSERT INTO google_auth (email, password, verified, verification_token) VALUES ($1, $2, $3, $4) RETURNING *",
             [email, hash, false, verificationToken]
           );
-          const user = result.rows[0];
 
-          // NEW: Send verification email via SendGrid
           const verificationLink = `${process.env.APP_URL}/verify-email?token=${verificationToken}`;
-          const msg = {
-            to: email,
-            from: {
-              name: "Secret App",
-              email: "noreply.secretapp@gmail.com",
-            },
-            subject: "Verify your email",
-            html: `
-              <h1>Email Verification</h1>
-              <p>Thanks for registering! Please verify your email by clicking the link below:</p>
-              <a href="${verificationLink}">${verificationLink}</a>
-              <p>This link will expire in 24 hours.</p>
-            `,
-          };
           try {
-            await sgMail.send(msg);
-            console.log("Verification email sent");
+            await sendVerificationEmail(email, verificationLink);
+            console.log("Verification email sent (Gmail)");
           } catch (error) {
             console.error("Error sending verification email:", error);
           }
 
-          // NEW: Instead of logging in immediately, tell them to check email
           res.send(
             "Registration successful! Please check your email to verify your account."
           );
@@ -200,7 +210,7 @@ app.post("/register", async (req, res) => {
   }
 });
 
-// --- NEW ROUTE: EMAIL VERIFICATION ---
+// --- EMAIL VERIFICATION ---
 app.get("/verify-email", async (req, res) => {
   const token = req.query.token;
 
@@ -209,9 +219,8 @@ app.get("/verify-email", async (req, res) => {
   }
 
   try {
-    // Find user with matching token
     const result = await db.query(
-      "SELECT * FROM auth WHERE verification_token = $1",
+      "SELECT * FROM google_auth WHERE verification_token = $1",
       [token]
     );
 
@@ -219,9 +228,8 @@ app.get("/verify-email", async (req, res) => {
       return res.status(400).send("Invalid token or already verified");
     }
 
-    // Update user to set verified = true and clear the token
     await db.query(
-      "UPDATE auth SET verified = true, verification_token = NULL WHERE verification_token = $1",
+      "UPDATE google_auth SET verified = true, verification_token = NULL WHERE verification_token = $1",
       [token]
     );
 
@@ -238,7 +246,7 @@ app.post("/submit", async (req, res) => {
   try {
     const secret = req.body.secret;
     const email = req.user.email;
-    await db.query("UPDATE auth SET secret = $1 WHERE email = $2", [
+    await db.query("UPDATE google_auth SET secret = $1 WHERE email = $2", [
       secret,
       email,
     ]);
@@ -253,13 +261,13 @@ passport.use(
   "local",
   new Strategy(async function verify(username, password, cb) {
     try {
-      const result = await db.query("SELECT * FROM auth WHERE email = $1 ", [
-        username,
-      ]);
+      const result = await db.query(
+        "SELECT * FROM google_auth WHERE email = $1 ",
+        [username]
+      );
       if (result.rows.length > 0) {
         const user = result.rows[0];
         if (!user.verified) {
-          // User exists but not verified
           console.log("User not verified");
           return cb(null, false, {
             message: "User not verified. Please check your email.",
@@ -268,15 +276,12 @@ passport.use(
         const storedHashedPassword = user.password;
         bcrypt.compare(password, storedHashedPassword, (err, valid) => {
           if (err) {
-            //Error with password check
             console.error("Error comparing passwords:", err);
             return cb(err);
           } else {
             if (valid) {
-              //Passed password check
               return cb(null, user);
             } else {
-              //Did not pass password check
               return cb(null, false);
             }
           }
@@ -301,14 +306,14 @@ passport.use(
     },
     async (accessToken, refreshToken, profile, cb) => {
       try {
-        console.log(profile);
-        const result = await db.query("SELECT * FROM auth WHERE email = $1", [
-          profile.email,
-        ]);
+        const result = await db.query(
+          "SELECT * FROM google_auth WHERE email = $1",
+          [profile.email]
+        );
         if (result.rows.length === 0) {
           const newUser = await db.query(
-            "INSERT INTO auth (email, password) VALUES ($1, $2)",
-            [profile.email, profile.id]
+            "INSERT INTO google_auth (email, verified) VALUES ($1, $2) RETURNING *",
+            [profile.email, true]
           );
           return cb(null, newUser.rows[0]);
         } else {
