@@ -5,6 +5,8 @@ import passport from "passport";
 import { Strategy } from "passport-local";
 import session from "express-session";
 import GoogleStrategy from "passport-google-oauth2";
+import sgMail from "@sendgrid/mail";
+import crypto from "crypto"; // NEW - to generate secure random tokens
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -42,6 +44,24 @@ db.connect()
   .catch((err) => console.error("DB connection error", err));
 
 // Items will be fetched from the database, not hardcoded.
+
+//SMTP setup
+sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+// const msg = {
+//   to: ["vinceumali81@gmail.com", "noreply.secretapp@gmail.com"],
+//   from: {
+//     name: "Secret App",
+//     email: "noreply.secretapp@gmail.com",
+//   },
+//   subject: "Welcome to Our Secret App!",
+//   text: "Thank you for registering!",
+//   html: "<h1>Thank you for registering!</h1>",
+// };
+
+// sgMail
+//   .send(msg)
+//   .then((response) => console.log("Email sent"))
+//   .catch((error) => console.error("Error sending email:", error));
 
 app.get("/", (req, res) => {
   res.render("home.ejs");
@@ -136,20 +156,79 @@ app.post("/register", async (req, res) => {
         if (err) {
           console.error("Error hashing password:", err);
         } else {
+          // NEW: Generate a unique verification token
+          const verificationToken = crypto.randomBytes(32).toString("hex");
+
           const result = await db.query(
-            "INSERT INTO auth (email, password) VALUES ($1, $2) RETURNING *",
-            [email, hash]
+            "INSERT INTO auth (email, password, verified, verification_token) VALUES ($1, $2, $3, $4) RETURNING *",
+            [email, hash, false, verificationToken]
           );
           const user = result.rows[0];
-          req.login(user, (err) => {
-            console.log("success");
-            res.redirect("/secrets");
-          });
+
+          // NEW: Send verification email via SendGrid
+          const verificationLink = `${process.env.APP_URL}/verify-email?token=${verificationToken}`;
+          const msg = {
+            to: email,
+            from: {
+              name: "Secret App",
+              email: "noreply.secretapp@gmail.com",
+            },
+            subject: "Verify your email",
+            html: `
+              <h1>Email Verification</h1>
+              <p>Thanks for registering! Please verify your email by clicking the link below:</p>
+              <a href="${verificationLink}">${verificationLink}</a>
+              <p>This link will expire in 24 hours.</p>
+            `,
+          };
+          try {
+            await sgMail.send(msg);
+            console.log("Verification email sent");
+          } catch (error) {
+            console.error("Error sending verification email:", error);
+          }
+
+          // NEW: Instead of logging in immediately, tell them to check email
+          res.send(
+            "Registration successful! Please check your email to verify your account."
+          );
         }
       });
     }
   } catch (err) {
     console.log(err);
+  }
+});
+
+// --- NEW ROUTE: EMAIL VERIFICATION ---
+app.get("/verify-email", async (req, res) => {
+  const token = req.query.token;
+
+  if (!token) {
+    return res.status(400).send("Invalid or missing token");
+  }
+
+  try {
+    // Find user with matching token
+    const result = await db.query(
+      "SELECT * FROM auth WHERE verification_token = $1",
+      [token]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(400).send("Invalid token or already verified");
+    }
+
+    // Update user to set verified = true and clear the token
+    await db.query(
+      "UPDATE auth SET verified = true, verification_token = NULL WHERE verification_token = $1",
+      [token]
+    );
+
+    res.send("Email successfully verified! You can now log in.");
+  } catch (err) {
+    console.error("Error verifying email:", err);
+    res.status(500).send("Internal Server Error");
   }
 });
 
@@ -179,6 +258,13 @@ passport.use(
       ]);
       if (result.rows.length > 0) {
         const user = result.rows[0];
+        if (!user.verified) {
+          // User exists but not verified
+          console.log("User not verified");
+          return cb(null, false, {
+            message: "User not verified. Please check your email.",
+          });
+        }
         const storedHashedPassword = user.password;
         bcrypt.compare(password, storedHashedPassword, (err, valid) => {
           if (err) {
