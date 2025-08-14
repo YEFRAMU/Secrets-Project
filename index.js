@@ -5,9 +5,12 @@ import passport from "passport";
 import { Strategy } from "passport-local";
 import session from "express-session";
 import GoogleStrategy from "passport-google-oauth2";
-import sgMail from "@sendgrid/mail";
-import crypto from "crypto"; // NEW - to generate secure random tokens
+// import sgMail from "@sendgrid/mail"; // REMOVED: switching to Gmail OAuth2
+import crypto from "crypto";
 import dotenv from "dotenv";
+// NEW:
+import nodemailer from "nodemailer";
+import { google } from "googleapis";
 
 dotenv.config();
 
@@ -23,9 +26,9 @@ app.use(
     secret: process.env.SESSION_SECRET,
     resave: false,
     saveUninitialized: true,
-    cookie: {
-      maxAge: 1000 * 60 * 60 * 24, // 1 day cookie expiry
-    },
+    //   cookie: {          //commented because after logout cookie still exists
+    //     maxAge: 1000 * 60 * 60 * 24, // 1 day cookie expiry
+    //   },
   })
 );
 
@@ -45,23 +48,60 @@ db.connect()
 
 // Items will be fetched from the database, not hardcoded.
 
-//SMTP setup
-sgMail.setApiKey(process.env.SENDGRID_API_KEY);
-// const msg = {
-//   to: ["vinceumali81@gmail.com", "noreply.secretapp@gmail.com"],
-//   from: {
-//     name: "Secret App",
-//     email: "noreply.secretapp@gmail.com",
-//   },
-//   subject: "Welcome to Our Secret App!",
-//   text: "Thank you for registering!",
-//   html: "<h1>Thank you for registering!</h1>",
-// };
+// =====================================
+// Email Setup (Gmail API + Nodemailer)
+// Replaces previous SendGrid logic.
+// Uses OAuth2 credentials + refresh token from .env:
+//   GMAIL_CLIENT_ID
+//   GMAIL_CLIENT_SECRET
+//   GMAIL_REDIRECT_URI
+//   GMAIL_SENDER_EMAIL
+//   GMAIL_REFRESH_TOKEN
+// =====================================
+const gmailOAuth2Client = new google.auth.OAuth2(
+  process.env.GMAIL_CLIENT_ID,
+  process.env.GMAIL_CLIENT_SECRET,
+  process.env.GMAIL_REDIRECT_URI
+);
 
-// sgMail
-//   .send(msg)
-//   .then((response) => console.log("Email sent"))
-//   .catch((error) => console.error("Error sending email:", error));
+async function sendVerificationEmail(to, verificationLink) {
+  // Acquire access token using stored refresh token
+  gmailOAuth2Client.setCredentials({
+    refresh_token: process.env.GMAIL_REFRESH_TOKEN,
+  });
+  const accessTokenObj = await gmailOAuth2Client.getAccessToken();
+  const accessToken = accessTokenObj.token || accessTokenObj;
+
+  const transporter = nodemailer.createTransport({
+    service: "gmail",
+    auth: {
+      type: "OAuth2",
+      user: process.env.GMAIL_SENDER_EMAIL,
+      clientId: process.env.GMAIL_CLIENT_ID,
+      clientSecret: process.env.GMAIL_CLIENT_SECRET,
+      refreshToken: process.env.GMAIL_REFRESH_TOKEN,
+      accessToken,
+    },
+  });
+
+  const html = `
+    <h1>Email Verification</h1>
+    <p>Thanks for registering! Please verify your email by clicking the link below:</p>
+    <a href="${verificationLink}">${verificationLink}</a>
+    <p>This link will expire in 24 hours.</p>
+  `;
+
+  await transporter.sendMail({
+    from: {
+      name: "Secret App",
+      address: process.env.GMAIL_SENDER_EMAIL, // per answer #3
+    },
+    to,
+    subject: "Verify your email",
+    html,
+  });
+}
+// =====================================
 
 app.get("/", (req, res) => {
   res.render("home.ejs");
@@ -163,32 +203,18 @@ app.post("/register", async (req, res) => {
             "INSERT INTO auth (email, password, verified, verification_token) VALUES ($1, $2, $3, $4) RETURNING *",
             [email, hash, false, verificationToken]
           );
-          const user = result.rows[0];
+          const user = result.rows[0]; // kept (even if unused now)
 
-          // NEW: Send verification email via SendGrid
           const verificationLink = `${process.env.APP_URL}/verify-email?token=${verificationToken}`;
-          const msg = {
-            to: email,
-            from: {
-              name: "Secret App",
-              email: "noreply.secretapp@gmail.com",
-            },
-            subject: "Verify your email",
-            html: `
-              <h1>Email Verification</h1>
-              <p>Thanks for registering! Please verify your email by clicking the link below:</p>
-              <a href="${verificationLink}">${verificationLink}</a>
-              <p>This link will expire in 24 hours.</p>
-            `,
-          };
+
+          // REPLACED: SendGrid send -> Gmail send
           try {
-            await sgMail.send(msg);
-            console.log("Verification email sent");
+            await sendVerificationEmail(email, verificationLink);
+            console.log("Verification email sent (Gmail)");
           } catch (error) {
             console.error("Error sending verification email:", error);
           }
 
-          // NEW: Instead of logging in immediately, tell them to check email
           res.send(
             "Registration successful! Please check your email to verify your account."
           );
